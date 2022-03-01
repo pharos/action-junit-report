@@ -54,18 +54,34 @@ function run() {
                 core.setFailed('❌ A token is required to execute this action');
                 return;
             }
+            const updateCheck = core.getInput('update_check') === 'true';
             const checkName = core.getInput('check_name');
             const commit = core.getInput('commit');
             const failOnFailure = core.getInput('fail_on_failure') === 'true';
             const requireTests = core.getInput('require_tests') === 'true';
             const includePassed = core.getInput('include_passed') === 'true';
+            const excludeSources = core.getInput('exclude_sources')
+                ? core.getInput('exclude_sources').split(',')
+                : [];
+            const checkRetries = core.getInput('check_retries') === 'true';
             core.endGroup();
             core.startGroup(`📦 Process test results`);
-            const testResult = yield (0, testParser_1.parseTestReports)(reportPaths, suiteRegex, includePassed, checkTitleTemplate);
+            const testResult = yield (0, testParser_1.parseTestReports)(reportPaths, suiteRegex, includePassed, checkRetries, excludeSources, checkTitleTemplate);
             const foundResults = testResult.count > 0 || testResult.skipped > 0;
-            const title = foundResults
-                ? `${testResult.count} tests run, ${testResult.skipped} skipped, ${testResult.annotations.length} failed.`
-                : 'No test results found!';
+            // get the count of passed and failed tests.
+            const passed = testResult.annotations.filter(a => a.annotation_level === 'notice').length;
+            const failed = testResult.annotations.length - passed;
+            core.setOutput('passed', passed);
+            core.setOutput('failed', failed);
+            let title = 'No test results found!';
+            if (foundResults) {
+                if (includePassed) {
+                    title = `${testResult.count} tests run, ${passed} passed, ${testResult.skipped} skipped, ${failed} failed.`;
+                }
+                else {
+                    title = `${testResult.count} tests run, ${testResult.skipped} skipped, ${failed} failed.`;
+                }
+            }
             core.info(`ℹ️ ${title}`);
             if (!foundResults) {
                 if (requireTests) {
@@ -81,22 +97,39 @@ function run() {
                 : 'failure';
             const status = 'completed';
             const head_sha = commit || (pullRequest && pullRequest.head.sha) || github.context.sha;
-            core.info(`ℹ️ Posting status '${status}' with conclusion '${conclusion}' to ${link} (sha: ${head_sha})`);
-            const createCheckRequest = Object.assign(Object.assign({}, github.context.repo), { name: checkName, head_sha,
-                status,
-                conclusion, output: {
-                    title,
-                    summary,
-                    annotations: testResult.annotations.slice(0, 50)
-                } });
-            core.debug(JSON.stringify(createCheckRequest, null, 2));
+            core.info(`ℹ️ Posting with conclusion '${conclusion}' to ${link} (sha: ${head_sha})`);
             core.endGroup();
             core.startGroup(`🚀 Publish results`);
             try {
                 const octokit = github.getOctokit(token);
-                yield octokit.rest.checks.create(createCheckRequest);
+                if (updateCheck) {
+                    const checks = yield octokit.rest.checks.listForRef(Object.assign(Object.assign({}, github.context.repo), { ref: head_sha, check_name: github.context.job, status: 'in_progress', filter: 'latest' }));
+                    core.debug(JSON.stringify(checks, null, 2));
+                    const check_run_id = checks.data.check_runs[0].id;
+                    core.info(`ℹ️ Updating checks ${testResult.annotations.length}`);
+                    for (let i = 0; i < testResult.annotations.length; i = i + 50) {
+                        const sliced = testResult.annotations.slice(i, i + 50);
+                        const updateCheckRequest = Object.assign(Object.assign({}, github.context.repo), { check_run_id, output: {
+                                title,
+                                summary,
+                                annotations: sliced
+                            } });
+                        core.debug(JSON.stringify(updateCheckRequest, null, 2));
+                        yield octokit.rest.checks.update(updateCheckRequest);
+                    }
+                }
+                else {
+                    const createCheckRequest = Object.assign(Object.assign({}, github.context.repo), { name: checkName, head_sha, status: 'completed', conclusion, output: {
+                            title,
+                            summary,
+                            annotations: testResult.annotations.slice(0, 50)
+                        } });
+                    core.debug(JSON.stringify(createCheckRequest, null, 2));
+                    core.info(`ℹ️ Creating check`);
+                    yield octokit.rest.checks.create(createCheckRequest);
+                }
                 if (failOnFailure && conclusion === 'failure') {
-                    core.setFailed(`❌ Tests reported ${testResult.annotations.length} failures`);
+                    core.setFailed(`❌ Tests reported ${failed} failures`);
                 }
             }
             catch (error) {
@@ -157,7 +190,7 @@ var __asyncValues = (this && this.__asyncValues) || function (o) {
     function settle(resolve, reject, d, v) { Promise.resolve(v).then(function(v) { resolve({ value: v, done: d }); }, reject); }
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.parseTestReports = exports.parseFile = exports.resolvePath = exports.resolveFileAndLine = void 0;
+exports.escapeEmoji = exports.parseTestReports = exports.parseFile = exports.resolvePath = exports.resolveFileAndLine = void 0;
 const core = __importStar(__nccwpck_require__(2186));
 const glob = __importStar(__nccwpck_require__(8090));
 const fs = __importStar(__nccwpck_require__(5747));
@@ -166,22 +199,26 @@ const parser = __importStar(__nccwpck_require__(8821));
  * Copyright 2020 ScaCap
  * https://github.com/ScaCap/action-surefire-report/blob/master/utils.js#L6
  *
- * Modification Copyright 2021 Mike Penz
+ * Modification Copyright 2022 Mike Penz
  * https://github.com/mikepenz/action-junit-report/
  */
-function resolveFileAndLine(file, className, output) {
+function resolveFileAndLine(file, line, className, output) {
     return __awaiter(this, void 0, void 0, function* () {
         let fileName = file ? file : className.split('.').slice(-1)[0];
+        const lineNumber = safeParseInt(line);
         try {
+            if (fileName && lineNumber) {
+                return { fileName, line: lineNumber };
+            }
             const escapedFileName = fileName
                 .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
                 .replace('::', '/'); // Rust test output contains colons between package names - See: https://github.com/mikepenz/action-junit-report/pull/359
             const matches = output.match(new RegExp(` [^ ]*${escapedFileName}.*?:\\d+`, 'g'));
             if (!matches)
-                return { fileName, line: 1 };
+                return { fileName, line: lineNumber || 1 };
             const [lastItem] = matches.slice(-1);
             const lineTokens = lastItem.split(':');
-            const line = lineTokens.pop() || '0';
+            line = lineTokens.pop() || '0';
             // check, if the error message is from a rust file -- this way we have the chance to find
             // out the involved test file
             // See: https://github.com/mikepenz/action-junit-report/pull/360
@@ -192,23 +229,34 @@ function resolveFileAndLine(file, className, output) {
                 }
             }
             core.debug(`Resolved file ${fileName} and line ${line}`);
-            return { fileName, line: parseInt(line) };
+            return { fileName, line: safeParseInt(line) || -1 };
         }
         catch (error) {
-            core.warning(`⚠️ Failed to resolve file and line for ${file} and ${className}`);
-            return { fileName, line: 1 };
+            core.warning(`⚠️ Failed to resolve file (${file}) and/or line (${line}) for ${className}`);
+            return { fileName, line: safeParseInt(line) || -1 };
         }
     });
 }
 exports.resolveFileAndLine = resolveFileAndLine;
 /**
+ * Parse the provided string line number, and return its value, or null if it is not available or NaN.
+ */
+function safeParseInt(line) {
+    if (!line)
+        return null;
+    const parsed = parseInt(line);
+    if (isNaN(parsed))
+        return null;
+    return parsed;
+}
+/**
  * Copyright 2020 ScaCap
  * https://github.com/ScaCap/action-surefire-report/blob/master/utils.js#L18
  *
- * Modification Copyright 2021 Mike Penz
+ * Modification Copyright 2022 Mike Penz
  * https://github.com/mikepenz/action-junit-report/
  */
-function resolvePath(fileName) {
+function resolvePath(fileName, excludeSources) {
     var e_1, _a;
     return __awaiter(this, void 0, void 0, function* () {
         core.debug(`Resolving path for ${fileName}`);
@@ -221,7 +269,8 @@ function resolvePath(fileName) {
             for (var _b = __asyncValues(globber.globGenerator()), _c; _c = yield _b.next(), !_c.done;) {
                 const result = _c.value;
                 core.debug(`Matched file: ${result}`);
-                if (!result.includes('/build/')) {
+                const found = excludeSources.find(v => result.includes(v));
+                if (!found) {
                     const path = result.slice(searchPath.length + 1);
                     core.debug(`Resolved path: ${path}`);
                     return path;
@@ -243,21 +292,21 @@ exports.resolvePath = resolvePath;
  * Copyright 2020 ScaCap
  * https://github.com/ScaCap/action-surefire-report/blob/master/utils.js#L43
  *
- * Modification Copyright 2021 Mike Penz
+ * Modification Copyright 2022 Mike Penz
  * https://github.com/mikepenz/action-junit-report/
  */
-function parseFile(file, suiteRegex = '', includePassed = false, checkTitleTemplate = undefined) {
+function parseFile(file, suiteRegex = '', includePassed = false, checkRetries = false, excludeSources = ['/build/', '/__pycache__/'], checkTitleTemplate = undefined) {
     return __awaiter(this, void 0, void 0, function* () {
         core.debug(`Parsing file ${file}`);
         const data = fs.readFileSync(file, 'utf8');
         const report = JSON.parse(parser.xml2json(data, { compact: true }));
-        return parseSuite(report, '', suiteRegex, includePassed, checkTitleTemplate);
+        return parseSuite(report, '', suiteRegex, includePassed, checkRetries, excludeSources, checkTitleTemplate);
     });
 }
 exports.parseFile = parseFile;
 function parseSuite(
 /* eslint-disable  @typescript-eslint/no-explicit-any */
-suite, parentName, suiteRegex, includePassed = false, checkTitleTemplate = undefined) {
+suite, parentName, suiteRegex, includePassed = false, checkRetries = false, excludeSources, checkTitleTemplate = undefined) {
     return __awaiter(this, void 0, void 0, function* () {
         let count = 0;
         let skipped = 0;
@@ -288,18 +337,43 @@ suite, parentName, suiteRegex, includePassed = false, checkTitleTemplate = undef
                     suiteName = testsuite._attributes.name;
                 }
             }
-            const res = yield parseSuite(testsuite, suiteName, suiteRegex, includePassed, checkTitleTemplate);
+            const res = yield parseSuite(testsuite, suiteName, suiteRegex, includePassed, checkRetries, excludeSources, checkTitleTemplate);
             count += res.count;
             skipped += res.skipped;
             annotations.push(...res.annotations);
             if (!testsuite.testcase) {
                 continue;
             }
-            const testcases = Array.isArray(testsuite.testcase)
+            let testcases = Array.isArray(testsuite.testcase)
                 ? testsuite.testcase
                 : testsuite.testcase
                     ? [testsuite.testcase]
                     : [];
+            if (checkRetries) {
+                // identify duplicates, in case of flaky tests, and remove them
+                const testcaseMap = new Map();
+                for (const testcase of testcases) {
+                    const key = testcase._attributes.name;
+                    if (testcaseMap.get(key) !== undefined) {
+                        // testcase with matching name exists
+                        const failed = testcase.failure || testcase.error;
+                        const previousFailed = testcaseMap.get(key).failure || testcaseMap.get(key).error;
+                        if (failed && !previousFailed) {
+                            // previous is a success, drop failure
+                            core.debug(`Drop flaky test failure for (1): ${key}`);
+                        }
+                        else if (!failed && previousFailed) {
+                            // previous failed, new one not, replace
+                            testcaseMap.set(key, testcase);
+                            core.debug(`Drop flaky test failure for (2): ${key}`);
+                        }
+                    }
+                    else {
+                        testcaseMap.set(key, testcase);
+                    }
+                }
+                testcases = Array.from(testcaseMap.values());
+            }
             for (const testcase of testcases) {
                 count++;
                 const failed = testcase.failure || testcase.error;
@@ -322,17 +396,17 @@ suite, parentName, suiteRegex, includePassed = false, checkTitleTemplate = undef
                             testcase.error._attributes.message) ||
                         stackTrace.split('\n').slice(0, 2).join('\n') ||
                         testcase._attributes.name).trim();
-                    const pos = yield resolveFileAndLine(testcase._attributes.file || testsuite._attributes.file, testcase._attributes.classname
+                    const pos = yield resolveFileAndLine(testcase._attributes.file || testsuite._attributes.file, testcase._attributes.line || testsuite._attributes.line, testcase._attributes.classname
                         ? testcase._attributes.classname
                         : testcase._attributes.name, stackTrace);
-                    let resolvedPath = yield resolvePath(pos.fileName);
+                    let resolvedPath = yield resolvePath(pos.fileName, excludeSources);
                     core.debug(`Path prior to stripping: ${resolvedPath}`);
                     const githubWorkspacePath = process.env['GITHUB_WORKSPACE'];
                     if (githubWorkspacePath) {
                         resolvedPath = resolvedPath.replace(`${githubWorkspacePath}/`, ''); // strip workspace prefix, make the path relative
                     }
                     let title = '';
-                    if (checkTitleTemplate !== undefined) {
+                    if (checkTitleTemplate) {
                         // ensure to not duplicate the test_name if file_name is equal
                         const fileName = pos.fileName !== testcase._attributes.name ? pos.fileName : '';
                         title = checkTitleTemplate
@@ -358,9 +432,9 @@ suite, parentName, suiteRegex, includePassed = false, checkTitleTemplate = undef
                         start_column: 0,
                         end_column: 0,
                         annotation_level: success ? 'notice' : 'failure',
-                        title,
-                        message,
-                        raw_details: stackTrace
+                        title: escapeEmoji(title),
+                        message: escapeEmoji(message),
+                        raw_details: escapeEmoji(stackTrace)
                     });
                 }
             }
@@ -372,10 +446,10 @@ suite, parentName, suiteRegex, includePassed = false, checkTitleTemplate = undef
  * Copyright 2020 ScaCap
  * https://github.com/ScaCap/action-surefire-report/blob/master/utils.js#L113
  *
- * Modification Copyright 2021 Mike Penz
+ * Modification Copyright 2022 Mike Penz
  * https://github.com/mikepenz/action-junit-report/
  */
-function parseTestReports(reportPaths, suiteRegex, includePassed = false, checkTitleTemplate = undefined) {
+function parseTestReports(reportPaths, suiteRegex, includePassed = false, checkRetries = false, excludeSources, checkTitleTemplate = undefined) {
     var e_2, _a;
     return __awaiter(this, void 0, void 0, function* () {
         const globber = yield glob.create(reportPaths, { followSymbolicLinks: false });
@@ -385,7 +459,7 @@ function parseTestReports(reportPaths, suiteRegex, includePassed = false, checkT
         try {
             for (var _b = __asyncValues(globber.globGenerator()), _c; _c = yield _b.next(), !_c.done;) {
                 const file = _c.value;
-                const { count: c, skipped: s, annotations: a } = yield parseFile(file, suiteRegex, includePassed, checkTitleTemplate);
+                const { count: c, skipped: s, annotations: a } = yield parseFile(file, suiteRegex, includePassed, checkRetries, excludeSources, checkTitleTemplate);
                 if (c === 0)
                     continue;
                 count += c;
@@ -404,6 +478,14 @@ function parseTestReports(reportPaths, suiteRegex, includePassed = false, checkT
     });
 }
 exports.parseTestReports = parseTestReports;
+/**
+ * Escape emoji sequences.
+ */
+function escapeEmoji(input) {
+    const regex = /[\u{1f300}-\u{1f5ff}\u{1f900}-\u{1f9ff}\u{1f600}-\u{1f64f}\u{1f680}-\u{1f6ff}\u{2600}-\u{26ff}\u{2700}-\u{27bf}\u{1f1e6}-\u{1f1ff}\u{1f191}-\u{1f251}\u{1f004}\u{1f0cf}\u{1f170}-\u{1f171}\u{1f17e}-\u{1f17f}\u{1f18e}\u{3030}\u{2b50}\u{2b55}\u{2934}-\u{2935}\u{2b05}-\u{2b07}\u{2b1b}-\u{2b1c}\u{3297}\u{3299}\u{303d}\u{00a9}\u{00ae}\u{2122}\u{23f3}\u{24c2}\u{23e9}-\u{23ef}\u{25b6}\u{23f8}-\u{23fa}]/gu;
+    return input.replace(regex, ``); // replace emoji with empty string (\\u${(match.codePointAt(0) || "").toString(16)})
+}
+exports.escapeEmoji = escapeEmoji;
 
 
 /***/ }),
